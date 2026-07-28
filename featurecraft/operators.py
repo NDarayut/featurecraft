@@ -37,10 +37,6 @@ class Operator:
     apply: Callable | None = None       # stateful: (state, inputs) -> values
 
     @property
-    def arity(self) -> int:
-        return 1 if self.kind in ("unary_num", "unary_cat") else 2
-
-    @property
     def stateful(self) -> bool:
         return self.fit_state is not None
 
@@ -87,9 +83,8 @@ def _fit_freq(cat: np.ndarray) -> dict:
 
 
 def _apply_freq(state: dict, cat: np.ndarray) -> np.ndarray:
-    counts = state["counts"]
-    keys = _cat_keys(cat)
-    return np.array([counts.get(k, 0) for k in keys], dtype=float)
+    keys = pd.Series(_cat_keys(cat))
+    return keys.map(state["counts"]).fillna(0.0).to_numpy(dtype=float)
 
 
 def _fit_groupby(agg: str):
@@ -113,23 +108,117 @@ def _fit_groupby(agg: str):
 
 
 def _apply_groupby(state: dict, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
-    mapping, fallback = state["mapping"], state["fallback"]
+    keys = pd.Series(_cat_keys(cat))
+    return (
+        keys.map(state["mapping"]).fillna(state["fallback"]).to_numpy(dtype=float)
+    )
+
+
+def _fit_groupby_moments(num: np.ndarray, cat: np.ndarray) -> dict:
+    """Per-group mean and std, for the deviation/z-score operators."""
     keys = _cat_keys(cat)
-    return np.array([mapping.get(k, fallback) for k in keys], dtype=float)
+    df = pd.DataFrame({"k": keys, "v": num.astype(float)})
+    grouped = df.groupby("k", sort=True)["v"]
+    means, stds, sizes = grouped.mean(), grouped.std(), grouped.size()
+    ok = {k for k in sizes.index if sizes[k] >= MIN_GROUP_SIZE}
+    g_mean = float(df["v"].mean()) if len(df) else float("nan")
+    g_std = float(df["v"].std()) if len(df) else float("nan")
+    return {
+        "mean": {k: float(v) for k, v in means.items() if k in ok and np.isfinite(v)},
+        "std": {k: float(v) for k, v in stds.items() if k in ok and np.isfinite(v)},
+        "g_mean": g_mean if np.isfinite(g_mean) else 0.0,
+        "g_std": g_std if np.isfinite(g_std) and g_std > EPS else 1.0,
+    }
+
+
+def _apply_groupby_dev(state: dict, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
+    """x minus its group mean: how unusual this row is within its group.
+
+    The signal the OpenFE paper's theory section is built around -- a row's
+    value matters relative to the group it belongs to, not just absolutely.
+    """
+    keys = pd.Series(_cat_keys(cat))
+    means = keys.map(state["mean"]).fillna(state["g_mean"]).to_numpy(dtype=float)
+    return num.astype(float) - means
+
+
+def _apply_groupby_zscore(state: dict, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
+    keys = pd.Series(_cat_keys(cat))
+    means = keys.map(state["mean"]).fillna(state["g_mean"]).to_numpy(dtype=float)
+    stds = keys.map(state["std"]).fillna(state["g_std"]).to_numpy(dtype=float)
+    stds = np.where(np.abs(stds) > EPS, stds, np.nan)
+    return (num.astype(float) - means) / stds
+
+
+def _fit_groupby_rank(num: np.ndarray, cat: np.ndarray) -> dict:
+    """Sorted training values per group, so replay can rank by searchsorted.
+
+    Stored as plain lists rather than arrays: operator state round-trips
+    through JSON in ``FeatureCrafter.to_json``.
+    """
+    keys = _cat_keys(cat)
+    v = num.astype(float)
+    finite = np.isfinite(v)
+    out: dict[str, list[float]] = {}
+    df = pd.DataFrame({"k": keys[finite], "v": v[finite]})
+    for k, sub in df.groupby("k", sort=True)["v"]:
+        if len(sub) >= MIN_GROUP_SIZE:
+            out[k] = np.sort(sub.to_numpy()).tolist()
+    return {"sorted": out, "global": np.sort(v[finite]).tolist()}
+
+
+def _apply_groupby_rank(state: dict, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
+    """Within-group quantile of x, in [0, 1]; NaN where the value is NaN."""
+    keys = _cat_keys(cat)
+    v = num.astype(float)
+    out = np.full(v.shape, np.nan, dtype=float)
+    tables = state["sorted"]
+    g = np.asarray(state["global"], dtype=float)
+    for k in pd.unique(keys):
+        ref = tables.get(k)
+        ref = g if ref is None else np.asarray(ref, dtype=float)
+        if ref.size == 0:
+            continue
+        idx = np.flatnonzero(keys == k)
+        vals = v[idx]
+        ok = np.isfinite(vals)
+        if not ok.any():
+            continue
+        out[idx[ok]] = np.searchsorted(ref, vals[ok], side="right") / ref.size
+    return out
+
+
+def _fit_nunique(a: np.ndarray, b: np.ndarray) -> dict:
+    """Distinct values of b within each level of a (GroupByThenNUnique)."""
+    ka, kb = _cat_keys(a), _cat_keys(b)
+    df = pd.DataFrame({"a": ka, "b": kb})
+    counts = df.groupby("a", sort=True)["b"].nunique()
+    return {"counts": {k: float(v) for k, v in counts.items()}, "fallback": 0.0}
+
+
+def _apply_nunique(state: dict, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    keys = pd.Series(_cat_keys(a))
+    return keys.map(state["counts"]).fillna(state["fallback"]).to_numpy(dtype=float)
 
 
 def _fit_cat_cross(a: np.ndarray, b: np.ndarray) -> dict:
     ka, kb = _cat_keys(a), _cat_keys(b)
     pairs = np.char.add(np.char.add(ka, "\x1f"), kb)
     uniq = np.unique(pairs)
+    # The cardinality guard the README documents. It was declared but never
+    # enforced: crossing two high-cardinality columns produced a near-unique
+    # code per row, which is pure noise to a model and expensive to carry.
+    if uniq.size > MAX_CROSS_CARDINALITY:
+        return {"codes": {}, "over_cardinality": True}
     return {"codes": {p: i for i, p in enumerate(uniq.tolist())}}
 
 
 def _apply_cat_cross(state: dict, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    codes = state["codes"]
+    if state.get("over_cardinality"):
+        return np.full(len(a), np.nan, dtype=float)
     ka, kb = _cat_keys(a), _cat_keys(b)
     pairs = np.char.add(np.char.add(ka, "\x1f"), kb)
-    return np.array([codes.get(p, -1) for p in pairs], dtype=float)
+    return pd.Series(pairs).map(state["codes"]).fillna(-1.0).to_numpy(dtype=float)
 
 
 OPERATORS: dict[str, Operator] = {
@@ -149,6 +238,16 @@ OPERATORS: dict[str, Operator] = {
         Operator("groupby_std", "groupby", "num", fit_state=_fit_groupby("std"), apply=_apply_groupby),
         Operator("groupby_min", "groupby", "num", fit_state=_fit_groupby("min"), apply=_apply_groupby),
         Operator("groupby_max", "groupby", "num", fit_state=_fit_groupby("max"), apply=_apply_groupby),
+        Operator("groupby_median", "groupby", "num", fit_state=_fit_groupby("median"), apply=_apply_groupby),
+        # Group-relative operators: these change the partition structure a tree
+        # can exploit, which is where tree-model gains come from.  A plain
+        # monotone transform of one column cannot help a GBDT at all.
+        Operator("groupby_dev", "groupby", "num", fit_state=_fit_groupby_moments, apply=_apply_groupby_dev),
+        Operator("groupby_zscore", "groupby", "num", fit_state=_fit_groupby_moments, apply=_apply_groupby_zscore),
+        Operator("groupby_rank", "groupby", "num", fit_state=_fit_groupby_rank, apply=_apply_groupby_rank),
+        Operator("nunique", "cat_pair", "num", fit_state=_fit_nunique, apply=_apply_nunique),
+        Operator("minimum", "binary_num", "num", fn=lambda a, b: np.minimum(a, b)),
+        Operator("maximum", "binary_num", "num", fn=lambda a, b: np.maximum(a, b)),
         Operator("cat_cross", "cat_cross", "cat", fit_state=_fit_cat_cross, apply=_apply_cat_cross),
     ]
 }

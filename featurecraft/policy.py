@@ -35,7 +35,12 @@ class OperatorBandit:
         return best
 
     def update(self, arm: str, reward: float) -> None:
-        reward = min(max(float(reward), 0.0), 1.0)
+        # Map an improvement-over-parent onto [0, 1] with 0.5 as "no change".
+        # Clipping raw improvement at 0 made every offspring worse than its
+        # parent indistinguishable from one exactly equal to it, so the bandit
+        # got no gradient among failures -- it could tell good from neutral,
+        # but never neutral from bad.
+        reward = min(max(0.5 + 0.5 * float(reward), 0.0), 1.0)
         if arm not in self.pulls:
             self.pulls[arm] = 0
             self.mean_reward[arm] = 0.0

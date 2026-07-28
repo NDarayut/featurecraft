@@ -24,13 +24,17 @@ _GROUPBY_AGG = {
     "groupby_std": "std",
     "groupby_min": "min",
     "groupby_max": "max",
+    "groupby_median": "median",
+    "groupby_dev": "dev",
+    "groupby_zscore": "zscore",
+    "groupby_rank": "rank",
 }
 
 
 class FeatureTree:
     """One engineered feature: either a leaf column or an operator node."""
 
-    __slots__ = ("op", "children", "column", "ctype", "state")
+    __slots__ = ("op", "children", "column", "ctype", "state", "_formula")
 
     def __init__(self, op=None, children=(), column=None, ctype=None, state=None):
         self.op: str | None = op
@@ -38,6 +42,12 @@ class FeatureTree:
         self.column: str | None = column
         self.ctype: str | None = ctype  # leaf output type: "num" | "cat"
         self.state: dict | None = state
+        # formula() is the identity key for memoisation, hall-of-fame offers
+        # and dedup, so it is called several times per individual per
+        # generation; recursing the whole tree to rebuild the same string each
+        # time was pure overhead.  Trees are treated as immutable in shape --
+        # mutation and crossover build new nodes rather than editing in place.
+        self._formula: str | None = None
 
     # ---------------------------------------------------------------- basics
     @property
@@ -102,6 +112,11 @@ class FeatureTree:
 
     # --------------------------------------------------------------- formula
     def formula(self) -> str:
+        if self._formula is None:
+            self._formula = self._build_formula()
+        return self._formula
+
+    def _build_formula(self) -> str:
         if self.is_leaf:
             return str(self.column)
         if self.op in _BIN_SYMBOL:
@@ -110,9 +125,10 @@ class FeatureTree:
         if self.op in _GROUPBY_AGG:
             num, cat = (c.formula() for c in self.children)
             return f"{_GROUPBY_AGG[self.op]}({num}) by ({cat})"
-        if self.op == "cat_cross":
+        if self.op in ("cat_cross", "nunique", "minimum", "maximum"):
             a, b = (c.formula() for c in self.children)
-            return f"cross({a}, {b})"
+            label = {"cat_cross": "cross"}.get(self.op, self.op)
+            return f"{label}({a}, {b})"
         return f"{self.op}({self.children[0].formula()})"
 
     def __repr__(self) -> str:
@@ -152,7 +168,7 @@ def _valid_ops(ops: dict[str, Operator], types: ColumnTypes, out_type: str) -> l
             continue
         if op.kind in ("unary_num", "binary_num") and not has_num:
             continue
-        if op.kind in ("unary_cat", "cat_cross") and not has_cat:
+        if op.kind in ("unary_cat", "cat_cross", "cat_pair") and not has_cat:
             continue
         if op.kind == "groupby" and not (has_num and has_cat):
             continue
@@ -187,6 +203,7 @@ def random_tree(
         "unary_cat": ("cat",),
         "groupby": ("num", "cat"),
         "cat_cross": ("cat", "cat"),
+        "cat_pair": ("cat", "cat"),
     }[op.kind]
     children = []
     for ct in child_types:
@@ -301,42 +318,75 @@ def mutate(
     return child, sub.op
 
 
-def depth1_candidates(types: ColumnTypes, ops: dict[str, Operator], limit: int) -> list[FeatureTree]:
-    """Deterministic enumeration of simple depth-1 trees (for seeding)."""
-    out: list[FeatureTree] = []
+def depth1_candidates(
+    types: ColumnTypes,
+    ops: dict[str, Operator],
+    limit: int,
+    total: int | None = None,
+) -> list[FeatureTree]:
+    """Deterministic enumeration of simple depth-1 trees (for seeding).
 
+    Each operator gets its own share of the budget.  The previous version
+    accumulated into one list and broke out of the *operator* loop once a
+    global cap was hit; because OPERATORS is ordered with the five unary_num
+    and four binary_num ops first, anything past ~20 numeric columns filled
+    the cap on arithmetic alone and `freq`, `groupby_*` and `cat_cross` were
+    never enumerated at all -- the very operators OpenFE's analysis argues
+    matter most.  Verified before the fix: 40 numeric / 5 categorical columns
+    produced 800 candidates, every one of them unary_num or binary_num.
+    """
     def num(c):
         return FeatureTree(column=c, ctype="num")
 
     def cat(c):
         return FeatureTree(column=c, ctype="cat")
 
-    for name, op in ops.items():
+    def per_op(name: str, op: Operator):
         if op.kind == "unary_num":
-            out.extend(FeatureTree(op=name, children=[num(c)]) for c in types.numeric)
+            for c in types.numeric:
+                yield FeatureTree(op=name, children=[num(c)])
         elif op.kind == "unary_cat":
-            out.extend(FeatureTree(op=name, children=[cat(c)]) for c in types.categorical)
+            for c in types.categorical:
+                yield FeatureTree(op=name, children=[cat(c)])
         elif op.kind == "groupby":
-            out.extend(
-                FeatureTree(op=name, children=[num(n), cat(c)])
-                for n in types.numeric for c in types.categorical
-            )
+            for n in types.numeric:
+                for c in types.categorical:
+                    yield FeatureTree(op=name, children=[num(n), cat(c)])
         elif op.kind == "binary_num":
             cols = types.numeric
             for i, a in enumerate(cols):
                 for b in (cols[i + 1:] if name != "div" else cols):
-                    if a == b:
-                        continue
-                    out.append(FeatureTree(op=name, children=[num(a), num(b)]))
+                    if a != b:
+                        yield FeatureTree(op=name, children=[num(a), num(b)])
         elif op.kind == "cat_cross":
             cols = types.categorical
-            out.extend(
-                FeatureTree(op=name, children=[cat(a), cat(b)])
-                for i, a in enumerate(cols) for b in cols[i + 1:]
-            )
-        if len(out) >= limit * 4:
-            break
-    return out[: limit * 4]
+            for i, a in enumerate(cols):
+                for b in cols[i + 1:]:
+                    yield FeatureTree(op=name, children=[cat(a), cat(b)])
+        elif op.kind == "cat_pair":
+            # asymmetric: nunique(a, b) counts b's levels within a
+            cols = types.categorical
+            for a in cols:
+                for b in cols:
+                    if a != b:
+                        yield FeatureTree(op=name, children=[cat(a), cat(b)])
+
+    total = limit * 4 if total is None else total
+    share = max(1, total // max(len(ops), 1))
+    out: list[FeatureTree] = []
+    leftover: list[FeatureTree] = []
+    for name, op in ops.items():
+        taken = 0
+        for tree in per_op(name, op):
+            if taken < share:
+                out.append(tree)
+                taken += 1
+            elif len(leftover) < total:
+                leftover.append(tree)
+            else:
+                break
+    # ops with fewer candidates than their share leave room; hand it back
+    return out + leftover[: max(0, total - len(out))]
 
 
 __all__ = [

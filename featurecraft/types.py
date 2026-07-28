@@ -68,6 +68,29 @@ def infer_types(X: pd.DataFrame) -> ColumnTypes:
     return ColumnTypes(tuple(numeric), tuple(categorical), tuple(datetime))
 
 
+def override_categorical(
+    types: ColumnTypes, categorical: list[str] | tuple[str, ...], columns: list[str]
+) -> ColumnTypes:
+    """Re-type columns from an explicit categorical list.
+
+    Callers that already know which columns are categorical (a benchmark
+    harness that ordinal-encoded them, say) can say so.  Inference on a
+    pre-encoded frame is unreliable in both directions: a high-cardinality
+    categorical encoded to integer codes looks numeric, and a low-cardinality
+    genuine count looks categorical.
+    """
+    unknown = [c for c in categorical if c not in columns]
+    if unknown:
+        raise ValueError(f"unknown categorical_features: {unknown}")
+    cat = set(categorical)
+    dt = set(types.datetime)
+    return ColumnTypes(
+        tuple(c for c in columns if c not in cat and c not in dt),
+        tuple(c for c in columns if c in cat),
+        types.datetime,
+    )
+
+
 def _is_integer_valued(s: pd.Series) -> bool:
     if s.dtype.kind != "f":
         return False
@@ -97,4 +120,5 @@ def expand_datetime(X: pd.DataFrame, dt_cols: tuple[str, ...]) -> pd.DataFrame:
 
 
 def datetime_component_columns(dt_cols: tuple[str, ...]) -> tuple[str, ...]:
+    """Names `expand_datetime` will produce for `dt_cols`."""
     return tuple(f"{c}__{p}" for c in dt_cols for p in _DT_COMPONENTS)

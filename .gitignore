@@ -5,3 +5,9 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# local-only: kept on disk, not part of the published package
+tests/
+benchmarks/
+research/
+PLAN.md
